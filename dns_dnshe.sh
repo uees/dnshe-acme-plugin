@@ -14,6 +14,14 @@
 #   export DNSHE_API_Secret="yyyyyyyyyyyy"
 #   export DNSHE_Subdomain_Id="123"   ← 你的域名内部 ID，非字符串
 #
+# 可选环境变量（不设置时脚本会自动通过 API 查询 subdomain_id 对应的域名）:
+#   export DNSHE_Zone="some.cc.cd"   ← subdomain_id 对应的完整域名
+#
+# 【重要】记录名规则：
+#   DNSHE create 接口的 name 只接受相对记录名或 @（@ 表示该 subdomain 的根），
+#   传完整 FQDN 会返回 invalid_record_name。
+#   例：_acme-challenge.some.cc.cd → _acme-challenge
+#
 # 查询 subdomain_id 的方法：
 #   curl -s "https://api005.dnshe.com/index.php?m=domain_hub&endpoint=subdomains&action=list" \
 #     -H "X-API-Key: cfsd_xxxxxxxxxx" \
@@ -32,6 +40,69 @@
 # ============================================================
 
 DNSHE_API_URL="https://api005.dnshe.com/index.php?m=domain_hub"
+
+# ────────────────────────────────────────────────────────────
+# dns_dnshe_relative_name()
+# 功能：把 acme.sh 传入的完整 FQDN 转成 DNSHE API 要求的相对记录名
+#   create 接口只接受相对名或 @（@ 表示该 subdomain 的根），
+#   传完整域名会返回 invalid_record_name。
+# 参数：$1 = fulldomain
+# 输出：_dnshe_zone（zone 完整域名）、_dnshe_record_name（相对名）
+# ────────────────────────────────────────────────────────────
+dns_dnshe_relative_name() {
+  _dnshe_full="${1%.}"
+  _dnshe_record_name=""
+  _dnshe_zone="${DNSHE_Zone:-}"
+
+  if [ -z "$_dnshe_zone" ]; then
+    _dnshe_zone="$(_readaccountconf_mutable DNSHE_Zone)"
+  fi
+
+  # 未配置 zone 时，按 subdomain_id 从 API 查出对应域名，避免硬编码
+  if [ -z "$_dnshe_zone" ]; then
+    _info "未设置 DNSHE_Zone，正在查询 subdomain_id=${DNSHE_Subdomain_Id} 对应的域名..."
+    _dnshe_list="$(curl -s --max-time 30 \
+      "${DNSHE_API_URL}&endpoint=subdomains&action=list" \
+      -H "X-API-Key: ${DNSHE_API_Key}" \
+      -H "X-API-Secret: ${DNSHE_API_Secret}")"
+    _dnshe_block="$(printf '%s' "$_dnshe_list" | tr '{' '\n' \
+      | grep -E "\"id\"[[:space:]]*:[[:space:]]*${DNSHE_Subdomain_Id}([^0-9]|$)")"
+
+    _dnshe_zone="$(printf '%s' "$_dnshe_block" \
+      | sed -n 's/.*"full_domain"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+
+    if [ -z "$_dnshe_zone" ]; then
+      _dnshe_sub="$(printf '%s' "$_dnshe_block" \
+        | sed -n 's/.*"subdomain"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+      _dnshe_root="$(printf '%s' "$_dnshe_block" \
+        | sed -n 's/.*"rootdomain"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+      if [ -n "$_dnshe_sub" ] && [ -n "$_dnshe_root" ]; then
+        _dnshe_zone="${_dnshe_sub}.${_dnshe_root}"
+      fi
+    fi
+  fi
+
+  if [ -z "$_dnshe_zone" ]; then
+    _err "❌ 无法确定域名 zone！请显式指定：export DNSHE_Zone='some.cc.cd'"
+    return 1
+  fi
+
+  case "$_dnshe_full" in
+    "$_dnshe_zone")
+      _dnshe_record_name="@"
+      ;;
+    *."$_dnshe_zone")
+      _dnshe_record_name="${_dnshe_full%.$_dnshe_zone}"
+      ;;
+    *)
+      _err "❌ '$_dnshe_full' 不属于 zone '$_dnshe_zone'，请检查 DNSHE_Subdomain_Id / DNSHE_Zone 是否匹配。"
+      return 1
+      ;;
+  esac
+
+  _info "zone: $_dnshe_zone  →  相对记录名: $_dnshe_record_name"
+  return 0
+}
 
 # ────────────────────────────────────────────────────────────
 # dns_dnshe_add()
@@ -77,11 +148,18 @@ dns_dnshe_add() {
   _saveaccountconf_mutable DNSHE_API_Key "$DNSHE_API_Key"
   _saveaccountconf_mutable DNSHE_API_Secret "$DNSHE_API_Secret"
   _saveaccountconf_mutable DNSHE_Subdomain_Id "$DNSHE_Subdomain_Id"
+  if [ -n "$DNSHE_Zone" ]; then
+    _saveaccountconf_mutable DNSHE_Zone "$DNSHE_Zone"
+  fi
+
+  # ── 计算相对记录名 ───────────────────────────────────────
+  if ! dns_dnshe_relative_name "$fulldomain"; then
+    return 1
+  fi
 
   # ── 构建 API 请求 ─────────────────────────────────────────
-  # DNSHE API V2.0: POST JSON, 认证通过 Header 传递
-  # name 字段：填写完整 FQDN，API 会自动处理相对记录名
-  body="{\"subdomain_id\": ${DNSHE_Subdomain_Id}, \"type\": \"TXT\", \"name\": \"${fulldomain}\", \"content\": \"${txtvalue}\", \"ttl\": 120}"
+  # DNSHE API V2.0: name 只接受相对记录名或 @，传 FQDN 会返回 invalid_record_name
+  body="{\"subdomain_id\": ${DNSHE_Subdomain_Id}, \"type\": \"TXT\", \"name\": \"${_dnshe_record_name}\", \"content\": \"${txtvalue}\", \"ttl\": 120}"
 
   _info "发送 API 请求..."
   _debug "请求体: $body"
